@@ -32,7 +32,8 @@ const unknownModel = (name: string) => new ReviewError({ message: `unknown model
 
 type Model = NonNullable<CreateAgentSessionOptions["model"]>
 
-const resolveModel: (name: string) => Effect.Effect<Model, ReviewError, Models> = Effect.fn("resolveModel")(function* (name: string) {
+// The model named "provider/model", failing when pi does not know it.
+export const resolveModel: (name: string) => Effect.Effect<Model, ReviewError, Models> = Effect.fn("resolveModel")(function* (name: string) {
   const models = yield* Models
   const slash = name.indexOf("/")
   if (slash <= 0) return yield* unknownModel(name)

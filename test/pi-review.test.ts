@@ -1,8 +1,8 @@
 // Runs the pi-review command on throwaway git repositories, with a scripted model in place of pi's real ones.
 import { afterAll, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { type AssistantMessage, fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseStep } from "@earendil-works/pi-ai"
 import { ModelRuntime } from "@earendil-works/pi-coding-agent"
 import { BunServices } from "@effect/platform-bun"
@@ -15,6 +15,8 @@ const secret = join(scratch, "secret.txt")
 writeFileSync(secret, "TOP-SECRET\n")
 const agentDir = join(scratch, "agent")
 process.env["PI_CODING_AGENT_DIR"] = agentDir
+const cacheDir = join(scratch, "cache")
+process.env["XDG_CACHE_HOME"] = cacheDir
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
 const sh = (cwd: string, ...args: Array<string>) => {
@@ -52,14 +54,14 @@ const toolCalls = (...calls: Array<[string, Record<string, string>]>) =>
     { stopReason: "toolUse" }
   )
 
-const fauxModelUnlessChosen = (args: Array<string>) => {
-  if (args.includes("--model")) return []
-  return ["--model", "faux/faux-1"]
+const savedReview = (path: string) => {
+  if (!existsSync(path)) return ""
+  return readFileSync(path, "utf-8")
 }
 
-// Runs pi-review with `args`; the model answers with `steps` in order. Resolves to what it printed and to each
-// request the model got, as JSON.
-const review = async (args: Array<string>, steps: Array<AssistantMessage>) => {
+// Runs pi-review with `args` in the repository; the model answers with `steps` in order. Resolves to what it printed,
+// the review it saved at the printed path and each request the model got, as JSON.
+const piReview = async (args: Array<string>, steps: Array<AssistantMessage> = []) => {
   const faux = fauxProvider()
   const requests: Array<string> = []
   faux.setResponses(
@@ -79,13 +81,22 @@ const review = async (args: Array<string>, steps: Array<AssistantMessage>) => {
     log: (...parts: Array<string>) => stdout.push(parts.join(" ")),
     error: (...parts: Array<string>) => stderr.push(parts.join(" ")),
   })
-  const program = run(["--path", repo, ...fauxModelUnlessChosen(args), ...args]).pipe(
+  const program = run(["--path", repo, ...args]).pipe(
     Effect.provide(Layer.mergeAll(Layer.succeed(Models, models), BunServices.layer)),
     Effect.provideService(Console.Console, console)
   )
   const exit = await Effect.runPromiseExit(program)
-  return { exit, stdout: stdout.join("\n"), stderr: stderr.join("\n"), requests }
+  const printed = stdout.join("\n")
+  return { exit, stdout: printed, saved: savedReview(printed), stderr: stderr.join("\n"), requests }
 }
+
+const fauxModelUnlessChosen = (args: Array<string>) => {
+  if (args.includes("--model")) return []
+  return ["--model", "faux/faux-1"]
+}
+
+// A review run in the foreground, with the scripted model unless `args` choose another.
+const review = (args: Array<string>, steps: Array<AssistantMessage>) => piReview(["--foreground", ...fauxModelUnlessChosen(args), ...args], steps)
 
 const failureMessage = async (args: Array<string>, steps: Array<AssistantMessage> = []) => {
   const { exit } = await review(args, steps)
@@ -94,12 +105,15 @@ const failureMessage = async (args: Array<string>, steps: Array<AssistantMessage
 }
 
 describe("pi-review", () => {
-  test("reviews the uncommitted changes, untracked files included, and prints the model's answer", async () => {
+  test("reviews the uncommitted changes, untracked files included, and saves the model's answer", async () => {
     write(repo, "src/app.ts", "export const answer = 43\n")
     write(repo, "src/new.ts", "export const added = true\n")
     const result = await review(["focus on the answer"], [toolCalls(["read", { path: "src/app.ts" }]), reply("## Verdict\n**correct**")])
 
-    expect(result.stdout).toBe("## Verdict\n**correct**")
+    expect(result.stdout).toStartWith(join(cacheDir, "pi-review", `${basename(repo)}-`))
+    expect(result.stdout).toEndWith(".md")
+    expect(result.saved).toBe("## Verdict\n**correct**\n")
+    expect(readFileSync(result.stdout.replace(/\.md$/, ".log"), "utf-8")).toContain("  read src/app.ts")
     const [first, second] = result.requests
     expect(first).toContain("Review the uncommitted changes")
     expect(first).toContain("focus on the answer")
@@ -133,7 +147,7 @@ describe("pi-review", () => {
       ]
     )
 
-    expect(result.stdout).toBe("No findings.")
+    expect(result.saved).toBe("No findings.\n")
     const toolResults = result.requests[1] ?? ""
     expect(toolResults).not.toContain("TOP-SECRET")
     expect(toolResults).toContain("only files in the repository can be read")
@@ -203,6 +217,44 @@ describe("pi-review", () => {
     write(repo, "src/app.ts", "export const answer = 43\n")
     const failed = fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid request" })
     expect(await failureMessage([], [failed])).toContain("the model failed: invalid request")
+  })
+
+  test("shows the latest review with --status", async () => {
+    write(repo, "src/app.ts", "export const answer = 43\n")
+    const { stdout } = await review([], [reply("No findings.")])
+    const status = await piReview(["--status"])
+
+    expect(status.stdout).toContain("state: done")
+    expect(status.stdout).toContain(`review: ${stdout}`)
+    expect(status.stdout).toContain("No findings.")
+  })
+
+  test("shows a failed review with its log", async () => {
+    write(repo, "src/app.ts", "export const answer = 43\n")
+    await review([], [fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid request" })])
+    const status = await piReview(["--status"])
+
+    expect(status.stdout).toContain("state: failed")
+    expect(status.stdout).toContain("pi-review: the model failed: invalid request")
+    expect(JSON.stringify(status.exit)).toContain("the review failed")
+  })
+
+  test("runs the review of the change as it was in the background and waits for it with --wait", async () => {
+    write(repo, "src/app.ts", "export const answer = 43\n")
+    // The detached run loads the user's models, where the scripted one is unknown, so it fails at once.
+    const started = await piReview(["--model", "faux/faux-1"])
+    expect(started.stderr).toContain("in the background")
+    // Undone at once: the run still reviews the change as it was when it was asked for.
+    write(repo, "src/app.ts", "export const answer = 42\n")
+    const waited = await piReview(["--wait"])
+
+    expect(waited.stdout).toContain(`review: ${started.stdout}`)
+    expect(waited.stdout).toContain("state: failed")
+    expect(waited.stdout).toContain("unknown model faux/faux-1")
+  })
+
+  test("fails --status when there is no review yet", async () => {
+    expect(JSON.stringify((await piReview(["--status"])).exit)).toContain("no review found")
   })
 
   test("refuses --base with --commit", async () => {
