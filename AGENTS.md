@@ -4,7 +4,8 @@ A CLI (Bun, Effect) that reviews a git change with the pi SDK. Learn the flags f
 
 - `src/change.ts` collects the change with git (uncommitted with untracked files, `--base`, `--commit`);
   `src/prompt.ts` holds the default rubric and puts the diff in the prompt; `src/reviewer.ts` runs an in-memory
-  pi session; `src/adapters/pi.ts` is the only place that calls pi's Promise API.
+  pi session; `src/adapters/pi.ts` is the only place that calls pi's Promise API; `src/config.ts` keeps the user's settings
+  (the default model) in `~/.config/pi-review/config.json` with effect-lib's json-store, changed with `pi-review config`.
 - A review runs detached by default: `src/runs.ts` starts the CLI again with `--foreground` and keeps each run's
   review, log, pid and exit code in `~/.cache/pi-review/<project>-<hash>/`, which `--status` and `--wait` read.
 - The reviewer gets no bash, edit or write. `src/confine.ts` replaces pi's read, grep, find and ls with copies whose

@@ -16,7 +16,8 @@
     "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@effect/platform-bun": "4.1.0",
-    "effect": "4.1.0"
+    "effect": "4.1.0",
+    "effect-lib": "github:laroccacharly/effect-lib#v0.17.0"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",

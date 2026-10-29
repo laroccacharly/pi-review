@@ -7,7 +7,6 @@ import { type AssistantMessage, fauxAssistantMessage, fauxProvider, fauxToolCall
 import { ModelRuntime } from "@earendil-works/pi-coding-agent"
 import { BunServices } from "@effect/platform-bun"
 import { Console, Effect, Layer } from "effect"
-import { run } from "../src/cli.ts"
 import { Models } from "../src/reviewer.ts"
 
 const scratch = mkdtempSync(join(tmpdir(), "pi-review-test-"))
@@ -17,6 +16,10 @@ const agentDir = join(scratch, "agent")
 process.env["PI_CODING_AGENT_DIR"] = agentDir
 const cacheDir = join(scratch, "cache")
 process.env["XDG_CACHE_HOME"] = cacheDir
+const configDir = join(scratch, "config")
+process.env["XDG_CONFIG_HOME"] = configDir
+// Imported once the folders above are set, since the config command takes its path when the CLI loads.
+const { run } = await import("../src/cli.ts")
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 
 const sh = (cwd: string, ...args: Array<string>) => {
@@ -42,6 +45,7 @@ beforeEach(() => {
   write(repo, "src/app.ts", "export const answer = 42\n")
   write(repo, "AGENTS.md", "REPO-RULE: money is in cents.\n")
   commitAll(repo, "Start the app")
+  rmSync(configDir, { recursive: true, force: true })
   sh(scratch, "mkdir", "-p", agentDir)
   writeFileSync(join(agentDir, "AGENTS.md"), "GLOBAL-RULE: open files in Zed.\n")
   writeFileSync(join(agentDir, "APPEND_SYSTEM.md"), "GLOBAL-APPEND: be terse.\n")
@@ -59,9 +63,15 @@ const savedReview = (path: string) => {
   return readFileSync(path, "utf-8")
 }
 
-// Runs pi-review with `args` in the repository; the model answers with `steps` in order. Resolves to what it printed,
-// the review it saved at the printed path and each request the model got, as JSON.
-const piReview = async (args: Array<string>, steps: Array<AssistantMessage> = []) => {
+const repositoryArgs = (inRepository: boolean) => {
+  if (inRepository) return ["--path", repo]
+  return []
+}
+
+// Runs pi-review with `args` in the repository, or without --path when `inRepository` is false; the model answers with
+// `steps` in order. Resolves to what it printed, the review it saved at the printed path and each request the model
+// got, as JSON.
+const piReview = async (args: Array<string>, steps: Array<AssistantMessage> = [], inRepository = true) => {
   const faux = fauxProvider()
   const requests: Array<string> = []
   faux.setResponses(
@@ -81,7 +91,7 @@ const piReview = async (args: Array<string>, steps: Array<AssistantMessage> = []
     log: (...parts: Array<string>) => stdout.push(parts.join(" ")),
     error: (...parts: Array<string>) => stderr.push(parts.join(" ")),
   })
-  const program = run(["--path", repo, ...args]).pipe(
+  const program = run([...repositoryArgs(inRepository), ...args]).pipe(
     Effect.provide(Layer.mergeAll(Layer.succeed(Models, models), BunServices.layer)),
     Effect.provideService(Console.Console, console)
   )
@@ -210,6 +220,18 @@ describe("pi-review", () => {
 
   test("fails on an unknown model", async () => {
     write(repo, "src/app.ts", "export const answer = 43\n")
+    expect(await failureMessage(["--model", "nowhere/none"])).toContain("unknown model nowhere/none")
+  })
+
+  test("reviews with the config's model when --model is not given, and --model overrides it", async () => {
+    write(repo, "src/app.ts", "export const answer = 43\n")
+    expect((await piReview(["config", "set", "model", "faux/faux-1"], [], false)).exit._tag).toBe("Success")
+    expect(JSON.parse(readFileSync(join(configDir, "pi-review", "config.json"), "utf-8"))).toEqual({ model: "faux/faux-1" })
+
+    const result = await piReview(["--foreground"], [reply("No findings.")])
+    expect(result.stderr).toContain("with faux/faux-1")
+    expect(result.saved).toBe("No findings.\n")
+
     expect(await failureMessage(["--model", "nowhere/none"])).toContain("unknown model nowhere/none")
   })
 

@@ -8,6 +8,7 @@ import { Argument, Command, Flag } from "effect/cli"
 import type { ChildProcessSpawner } from "effect/process"
 import packageJson from "../package.json" with { type: "json" }
 import { collectChange, type ReviewTarget } from "./change.ts"
+import { chosenModel, configStore, defaultModel, JsonStoreError } from "./config.ts"
 import { type ReadOnlyToolName, readOnlyToolNames } from "./confine.ts"
 import { GitError, repositoryRoot } from "./git.ts"
 import { defaultRubric, reviewPrompt } from "./prompt.ts"
@@ -16,15 +17,13 @@ import { detachedRun, latestRun, newRun, readRequest, recordExit, type Run, type
 
 const thinkingLevels: ReadonlyArray<ThinkingLevel> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 
-const defaultModel = "openai/gpt-6.1-sol"
-
 const waitTimeout = "15 minutes"
 
 const flags = {
   path: Flag.String("path").pipe(Flag.withDescription("A folder in the repository to review (default: the current one)"), Flag.withDefault(".")),
   base: Flag.String("base").pipe(Flag.withDescription("Review the changes against this branch instead of the uncommitted ones"), Flag.optional),
   commit: Flag.String("commit").pipe(Flag.withDescription("Review the changes of this commit instead of the uncommitted ones"), Flag.optional),
-  model: Flag.String("model").pipe(Flag.withDescription(`The reviewer, as provider/model (default: ${defaultModel})`), Flag.withDefault(defaultModel)),
+  model: Flag.String("model").pipe(Flag.withDescription(`The reviewer, as provider/model (default: the config's model, else ${defaultModel})`), Flag.optional),
   thinking: Flag.Literals("thinking", thinkingLevels).pipe(Flag.withDescription("The reviewer's thinking level (default: medium)"), Flag.withDefault<ThinkingLevel>("medium")),
   tools: Flag.Literals("tool", readOnlyToolNames).pipe(
     Flag.withDescription("A tool the reviewer may use, repeatable (default: read, grep, find and ls)"),
@@ -85,14 +84,21 @@ type PreparedSettings = Omit<ReviewSettings, "root" | "onToolCall">
 type ReviewServices = Models | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
 
 // The repository, its change and the review's settings, checked before anything runs.
-const prepareReview: (options: ReviewOptions) => Effect.Effect<{ readonly root: string; readonly summary: string; readonly settings: PreparedSettings }, GitError | ReviewError, Models | ChildProcessSpawner.ChildProcessSpawner> =
+const prepareReview: (
+  options: ReviewOptions
+) => Effect.Effect<
+  { readonly root: string; readonly summary: string; readonly settings: PreparedSettings },
+  GitError | ReviewError | JsonStoreError,
+  Models | FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+> =
   Effect.fn("prepareReview")(function* (options: ReviewOptions) {
     const target = yield* reviewTarget(options.base, options.commit)
     const root = yield* repositoryRoot(options.path)
     const change = yield* collectChange(root, target)
-    yield* resolveModel(options.model)
+    const model = yield* chosenModel(options.model)
+    yield* resolveModel(model)
     const settings = {
-      model: options.model,
+      model,
       thinking: options.thinking,
       tools: chosenTools(options.tools),
       rubric: Option.getOrElse(options.rubric, () => defaultRubric),
@@ -101,13 +107,13 @@ const prepareReview: (options: ReviewOptions) => Effect.Effect<{ readonly root: 
     return { root, summary: change.summary, settings }
   })
 
-const exitCode = <A>(exit: Exit.Exit<A, GitError | ReviewError>) => {
+const exitCode = <A>(exit: Exit.Exit<A, GitError | ReviewError | JsonStoreError>) => {
   if (Exit.isSuccess(exit)) return 0
   return 1
 }
 
 // Records the run's exit code once `effect` ends, however it ends.
-const recordingExit = (run: Run) => <A, E extends GitError | ReviewError, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.onExit((exit) => recordExit(run, exitCode(exit))))
+const recordingExit = (run: Run) => <A, E extends GitError | ReviewError | JsonStoreError, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.onExit((exit) => recordExit(run, exitCode(exit))))
 
 // Runs the review in this process and saves it, writing its progress lines with `progress`.
 const reviewHere: (run: Run, root: string, settings: PreparedSettings, progress: (line: string) => void) => Effect.Effect<string, ReviewError, Models | FileSystem.FileSystem> = Effect.fn("reviewHere")(
@@ -128,7 +134,7 @@ const reviewDetached: (run: Run) => Effect.Effect<string, ReviewError, Models | 
 
 // A run in the foreground writes its progress lines and errors to the terminal and to its log, then prints the
 // review's path.
-const reviewInForeground: (options: ReviewOptions) => Effect.Effect<void, GitError | ReviewError, ReviewServices> = Effect.fn("reviewInForeground")(function* (options: ReviewOptions) {
+const reviewInForeground: (options: ReviewOptions) => Effect.Effect<void, GitError | ReviewError | JsonStoreError, ReviewServices> = Effect.fn("reviewInForeground")(function* (options: ReviewOptions) {
   const console = yield* Console.Console
   const { root, settings } = yield* prepareReview(options)
   const run = yield* newRun(root)
@@ -145,11 +151,11 @@ const reviewInForeground: (options: ReviewOptions) => Effect.Effect<void, GitErr
 })
 
 // Starts the review in the background and prints the path its review will have.
-const startReview: (options: ReviewOptions) => Effect.Effect<void, GitError | ReviewError, ReviewServices> = Effect.fn("startReview")(function* (options: ReviewOptions) {
+const startReview: (options: ReviewOptions) => Effect.Effect<void, GitError | ReviewError | JsonStoreError, ReviewServices> = Effect.fn("startReview")(function* (options: ReviewOptions) {
   const { root, summary, settings } = yield* prepareReview(options)
   const run = yield* newRun(root)
   yield* startDetached(run, { root, settings })
-  yield* Console.error(`reviewing ${summary} in ${root} with ${options.model} in the background; follow it with --status or --wait`)
+  yield* Console.error(`reviewing ${summary} in ${root} with ${settings.model} in the background; follow it with --status or --wait`)
   yield* Console.log(run.review)
 })
 
@@ -167,14 +173,15 @@ export const piReview = Command.make(
 ).pipe(
   Command.withDescription(
     "Review a git change with pi: the diff goes in the prompt, the reviewer reads the repository with read-only tools. The review runs in the background and is saved in ~/.cache/pi-review/, with its log; the path of the review is printed."
-  )
+  ),
+  Command.withSubcommands([configStore().commands()])
 )
 
 // Runs pi-review on its command-line arguments.
 export const run = (args: ReadonlyArray<string>) => Command.runWith(piReview, { version: packageJson.version })(args)
 
 // pi-review's own failures are a message for the user, not a stack trace.
-const report = (error: GitError | ReviewError) =>
+const report = (error: GitError | ReviewError | JsonStoreError) =>
   Console.error(`pi-review: ${error.message}`).pipe(
     Effect.andThen(
       Effect.sync(() => {
@@ -184,5 +191,5 @@ const report = (error: GitError | ReviewError) =>
   )
 
 if (import.meta.main) {
-  BunRuntime.runMain(run(process.argv.slice(2)).pipe(Effect.provide(Layer.mergeAll(Models.layer, BunServices.layer)), Effect.catchTags({ GitError: report, ReviewError: report })))
+  BunRuntime.runMain(run(process.argv.slice(2)).pipe(Effect.provide(Layer.mergeAll(Models.layer, BunServices.layer)), Effect.catchTags({ GitError: report, ReviewError: report, JsonStoreError: report })))
 }
